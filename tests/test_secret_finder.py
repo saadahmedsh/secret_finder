@@ -1,6 +1,7 @@
 """Automated tests for Secret Finder."""
 
 import io
+import json
 from pathlib import Path
 import subprocess
 import pytest
@@ -15,11 +16,6 @@ from secret_finder.diff_parser import (
     read_diff_from_file,
 )
 from secret_finder.models import DiffLine
-
-
-def test_cli_help_exits_cleanly() -> None:
-    """Verify CLI parser initializes and handles arguments cleanly."""
-    assert main([]) == 0
 
 
 def test_diff_parser_tracks_files_hunks_and_line_numbers() -> None:
@@ -207,3 +203,64 @@ def test_detectors_suppress_false_positives() -> None:
 
     for line in benign_lines:
         assert scan_diff_line(line) == [], f"Unexpected finding on benign line: {line}"
+
+
+def test_cli_end_to_end_reporting_json_and_exit_codes(tmp_path: Path) -> None:
+    """Verify CLI text/JSON reporting, required fields, and exit codes 0, 1, and 2."""
+    aws_key = "AKIA" + "IOSFODNN7EXAMPLE"
+    diff_with_secret = "\n".join(
+        [
+            "diff --git a/src/settings.py b/src/settings.py",
+            "--- a/src/settings.py",
+            "+++ b/src/settings.py",
+            "@@ -4,0 +5,2 @@",
+            f'+AWS_KEY = "{aws_key}"',
+            '+SAFE_VAR = "hello"',
+        ]
+    )
+
+    out_text = io.StringIO()
+    exit_code = main(
+        ["--diff", "-"],
+        stdin_stream=io.StringIO(diff_with_secret),
+        stdout_stream=out_text,
+    )
+    report = out_text.getvalue()
+
+    assert exit_code == 1
+    assert "src/settings.py:5" in report
+    assert "AWS Access Key ID pattern" in report
+    assert aws_key not in report
+    assert "AKIA************MPLE" in report
+
+    out_json = io.StringIO()
+    json_exit_code = main(
+        ["--diff", "-", "--json"],
+        stdin_stream=io.StringIO(diff_with_secret),
+        stdout_stream=out_json,
+    )
+    payload = json.loads(out_json.getvalue())
+
+    assert json_exit_code == 1
+    assert payload["count"] == 1
+    assert payload["findings"][0]["file_path"] == "src/settings.py"
+    assert payload["findings"][0]["line_number"] == 5
+    assert payload["findings"][0]["rule_id"] == "AWS_ACCESS_KEY"
+
+    clean_diff = "--- a/app.py\n+++ b/app.py\n@@ -1,0 +1,1 @@\n+x = 42\n"
+    out_clean = io.StringIO()
+    clean_exit_code = main(
+        ["--diff", "-"],
+        stdin_stream=io.StringIO(clean_diff),
+        stdout_stream=out_clean,
+    )
+    assert clean_exit_code == 0
+    assert "No secrets detected." in out_clean.getvalue()
+
+    err_stream = io.StringIO()
+    err_exit_code = main(
+        ["--diff", str(tmp_path / "nonexistent.diff")],
+        stderr_stream=err_stream,
+    )
+    assert err_exit_code == 2
+    assert "Error:" in err_stream.getvalue()
