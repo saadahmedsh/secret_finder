@@ -6,6 +6,7 @@ import subprocess
 import pytest
 
 from secret_finder.cli import main
+from secret_finder.detectors import scan_diff_line, scan_diff_lines
 from secret_finder.diff_parser import (
     DiffSourceError,
     get_commit_diff,
@@ -140,3 +141,69 @@ def test_git_commit_and_working_tree_diff_modes(tmp_path: Path) -> None:
 
     with pytest.raises(DiffSourceError, match="Git error for commit"):
         get_commit_diff("deadbeef999999999999", cwd=tmp_path)
+
+
+def test_detectors_flag_provider_generic_and_high_entropy_secrets() -> None:
+    """Verify Layer 1 signatures, Layer 2 generic assignments, Layer 3 entropy, deduplication, and redaction."""
+    aws_key = "AKIA" + "IOSFODNN7EXAMPLE"
+    gh_token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+    slack_token = "xoxb-" + "123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"
+    stripe_key = "sk_live_" + "51H8b9c2e3f4g5h6i7j8k9l0m1n2o3p4q"
+    google_key = "AIza" + "SyDa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+    private_key_header = "-----BEGIN " + "RSA PRIVATE KEY-----"
+    generic_pass = "Sup3r$ecretProdPass99!"
+    entropy_blob = "k9#mP2$vL8@nQ5!xR7&wZ4^yT1*uB3"
+
+    lines = [
+        DiffLine("aws.py", 10, f'aws_secret = "{aws_key}"'),
+        DiffLine("gh.py", 20, f'token = "{gh_token}"'),
+        DiffLine("slack.py", 30, f'SLACK = "{slack_token}"'),
+        DiffLine("billing.py", 40, f'STRIPE = "{stripe_key}"'),
+        DiffLine("gcp.py", 50, f'GCP_KEY = "{google_key}"'),
+        DiffLine("id_rsa", 1, private_key_header),
+        DiffLine("db.yaml", 12, f'db_password: "{generic_pass}"'),
+        DiffLine("crypto.py", 88, f'SIGNING_BLOB = "{entropy_blob}"'),
+    ]
+
+    findings = scan_diff_lines(lines)
+    assert len(findings) == 8
+
+    rule_ids = [f.rule_id for f in findings]
+    assert rule_ids == [
+        "AWS_ACCESS_KEY",
+        "GITHUB_TOKEN",
+        "SLACK_TOKEN",
+        "STRIPE_KEY",
+        "GOOGLE_API_KEY",
+        "PRIVATE_KEY",
+        "GENERIC_PASSWORD",
+        "HIGH_ENTROPY",
+    ]
+
+    for finding in findings:
+        assert aws_key not in finding.snippet
+        assert gh_token not in finding.snippet
+        assert generic_pass not in finding.snippet
+        assert entropy_blob not in finding.snippet
+
+
+def test_detectors_suppress_false_positives() -> None:
+    """Verify environment lookups, placeholders, URLs, file paths, and UUIDs are not flagged."""
+    benign_lines = [
+        DiffLine("config.py", 1, 'api_key = os.environ["SECRET_API_KEY"]'),
+        DiffLine("config.py", 2, "password = os.getenv('DB_PASSWORD')"),
+        DiffLine("config.js", 3, "const secret = process.env.JWT_SECRET;"),
+        DiffLine("config.yaml", 4, "password: ${DB_PASSWORD}"),
+        DiffLine("settings.py", 5, 'password = "changeme"'),
+        DiffLine("settings.py", 6, 'api_key = "your_api_key_here"'),
+        DiffLine("settings.py", 7, 'secret = "example_secret_value"'),
+        DiffLine("settings.py", 8, 'token = "TODO_replace_before_prod"'),
+        DiffLine("settings.py", 9, 'password = "xxxxxxxxxxxx"'),
+        DiffLine("settings.py", 10, 'secret = "<secret>"'),
+        DiffLine("client.py", 11, 'endpoint = "https://api.example.com/v1/users/authenticate"'),
+        DiffLine("paths.py", 12, 'cert_path = "/usr/local/share/ca-certificates/root.crt"'),
+        DiffLine("models.py", 13, 'request_id = "550e8400-e29b-41d4-a716-446655440000"'),
+    ]
+
+    for line in benign_lines:
+        assert scan_diff_line(line) == [], f"Unexpected finding on benign line: {line}"
