@@ -130,9 +130,12 @@ def test_git_commit_and_working_tree_diff_modes(tmp_path: Path) -> None:
     ]
 
     tracked_file.write_text("line1 = 'initial'\nline2 = 'uncommitted'\n", encoding="utf-8")
+    untracked_file = tmp_path / "new_untracked.py"
+    untracked_file.write_text("untracked_var = 'added'\n", encoding="utf-8")
     working_diff = get_working_tree_diff(cwd=tmp_path)
     assert parse_unified_diff(working_diff) == [
-        DiffLine(file_path="service.py", line_number=2, content="line2 = 'uncommitted'")
+        DiffLine(file_path="service.py", line_number=2, content="line2 = 'uncommitted'"),
+        DiffLine(file_path="new_untracked.py", line_number=1, content="untracked_var = 'added'"),
     ]
 
     with pytest.raises(DiffSourceError, match="Git error for commit"):
@@ -199,6 +202,11 @@ def test_detectors_suppress_false_positives() -> None:
         DiffLine("client.py", 11, 'endpoint = "https://api.example.com/v1/users/authenticate"'),
         DiffLine("paths.py", 12, 'cert_path = "/usr/local/share/ca-certificates/root.crt"'),
         DiffLine("models.py", 13, 'request_id = "550e8400-e29b-41d4-a716-446655440000"'),
+        DiffLine("pyproject.toml", 14, 'secret-finder = "secret_finder.cli:main"'),
+        DiffLine("detectors.py", 15, r'pattern = re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,250}\b")'),
+        DiffLine("lock.toml", 16, 'checksum = "sha256:abcdef1234567890abcdef1234567890"'),
+        DiffLine("fstring.py", 17, 'aws_secret = "{aws_key}"'),
+        DiffLine("typed.py", 18, "api_key_Validator: Optional[str] = None"),
     ]
 
     for line in benign_lines:

@@ -158,20 +158,61 @@ def get_commit_diff(commit_hash: str, cwd: str | Path | None = None) -> str:
     return result.stdout
 
 
-def get_working_tree_diff(cwd: str | Path | None = None) -> str:
-    """Retrieve unified diff for uncommitted changes (staged + unstaged) in the working directory.
+def _build_untracked_files_diff(cwd: str | Path | None = None) -> str:
+    """Build synthetic unified diff sections for untracked, non-ignored working tree files."""
+    untracked_proc = _run_git(["ls-files", "--others", "--exclude-standard"], cwd=cwd)
+    if untracked_proc.returncode != 0 or not untracked_proc.stdout.strip():
+        return ""
 
-    Diffs against HEAD when available, falling back to combining staged and unstaged
-    diffs for newly initialized repositories with an unborn HEAD.
+    base_dir = Path(cwd) if cwd is not None else Path.cwd()
+    sections: list[str] = []
+
+    for rel_path in untracked_proc.stdout.splitlines():
+        rel_clean = rel_path.strip()
+        if not rel_clean or should_skip_file(rel_clean):
+            continue
+        full_path = base_dir / rel_clean
+        if not full_path.is_file():
+            continue
+        try:
+            raw_bytes = full_path.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in raw_bytes[:8192]:
+            continue
+        text = raw_bytes.decode("utf-8", errors="replace")
+        file_lines = text.splitlines()
+        if not file_lines:
+            continue
+        added_body = "\n".join(f"+{line}" for line in file_lines)
+        sections.append(
+            f"diff --git a/{rel_clean} b/{rel_clean}\n"
+            f"--- /dev/null\n"
+            f"+++ b/{rel_clean}\n"
+            f"@@ -0,0 +1,{len(file_lines)} @@\n"
+            f"{added_body}"
+        )
+
+    return "\n".join(sections)
+
+
+def get_working_tree_diff(cwd: str | Path | None = None) -> str:
+    """Retrieve unified diff for uncommitted changes (staged, unstaged, and untracked) in the working directory.
+
+    Diffs tracked files against HEAD when available, falling back to combining staged and
+    unstaged diffs for newly initialized repositories with an unborn HEAD, and appends
+    untracked non-ignored files.
     """
     check_repo = _run_git(["rev-parse", "--is-inside-work-tree"], cwd=cwd)
     if check_repo.returncode != 0:
         err_msg = check_repo.stderr.strip() or "Not inside a Git repository."
         raise DiffSourceError(f"Git repository error: {err_msg}")
 
+    untracked_diff = _build_untracked_files_diff(cwd=cwd)
+
     head_diff = _run_git(["diff", "--unified=0", "--no-color", "HEAD"], cwd=cwd)
     if head_diff.returncode == 0:
-        return head_diff.stdout
+        return f"{head_diff.stdout}\n{untracked_diff}".strip()
 
     unstaged = _run_git(["diff", "--unified=0", "--no-color"], cwd=cwd)
     staged = _run_git(["diff", "--cached", "--unified=0", "--no-color"], cwd=cwd)
@@ -179,4 +220,4 @@ def get_working_tree_diff(cwd: str | Path | None = None) -> str:
         err_msg = unstaged.stderr.strip() or staged.stderr.strip() or "Unable to read working tree diff."
         raise DiffSourceError(f"Git diff error: {err_msg}")
 
-    return f"{staged.stdout}\n{unstaged.stdout}"
+    return f"{staged.stdout}\n{unstaged.stdout}\n{untracked_diff}".strip()

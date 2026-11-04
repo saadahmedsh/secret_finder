@@ -81,6 +81,8 @@ UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
+ENTRYPOINT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.]*:[a-zA-Z_][a-zA-Z0-9_]*$")
+
 ENV_LOOKUP_PATTERNS: tuple[str, ...] = (
     "os.environ",
     "os.getenv",
@@ -110,6 +112,8 @@ PLACEHOLDER_SUBSTRINGS: tuple[str, ...] = (
     "sample",
     "xxxxxx",
     "******",
+    "0123456789abcdef",
+    "abcdefghijklmnop",
 )
 
 PLACEHOLDER_EXACT: frozenset[str] = frozenset(
@@ -124,6 +128,26 @@ PLACEHOLDER_EXACT: frozenset[str] = frozenset(
         "secret",
         "api_key",
     }
+)
+
+NON_SECRET_KEY_NAMES: frozenset[str] = frozenset(
+    {
+        "secret-finder",
+        "secret_finder",
+    }
+)
+
+REGEX_SYNTAX_MARKERS: tuple[str, ...] = (
+    r"\b",
+    r"\d",
+    r"\w",
+    r"\s",
+    "[0-9",
+    "[a-z",
+    "[A-Z",
+    "){",
+    "]+",
+    "]*",
 )
 
 
@@ -161,17 +185,20 @@ def _is_env_or_reference(line_content: str, value: str) -> bool:
     lower_line = line_content.lower()
     if any(marker in lower_line for marker in ENV_LOOKUP_PATTERNS):
         return True
-    if value.startswith(("$", "${", "{{", "%(", "<", "[")):
+    if value.startswith(("$", "${", "{", "%(", "<", "[")):
         return True
-    if value.endswith((">", "}}")) or "(" in value or ")" in value:
+    if value.endswith((">", "}")) or any(ch in value for ch in ("(", ")", "[", "]", "{", "}")):
         return True
     return False
 
 
 def _is_placeholder_or_non_secret(value: str) -> bool:
-    """Return True if the candidate value is a known placeholder, URL, path, or UUID."""
-    lower_val = value.strip().lower()
+    """Return True if the candidate value is a placeholder, URL, path, checksum, regex, or UUID."""
+    stripped_val = value.strip()
+    lower_val = stripped_val.lower()
     if len(lower_val) < 8:
+        return True
+    if " " in stripped_val or "\t" in stripped_val:
         return True
     if lower_val in PLACEHOLDER_EXACT:
         return True
@@ -179,13 +206,29 @@ def _is_placeholder_or_non_secret(value: str) -> bool:
         return True
     if len(set(lower_val)) <= 2:
         return True
-    if UUID_RE.match(value):
+    if UUID_RE.match(stripped_val) or ENTRYPOINT_RE.match(stripped_val):
         return True
-    if lower_val.startswith(("http://", "https://", "ftp://", "ws://", "wss://", "git@", "mailto:")):
+    if lower_val.startswith(
+        (
+            "http://",
+            "https://",
+            "ftp://",
+            "ws://",
+            "wss://",
+            "git@",
+            "mailto:",
+            "sha256:",
+            "sha512:",
+            "sha1:",
+            "md5:",
+        )
+    ):
         return True
     if lower_val.startswith(("/", "./", "../", "~/", "c:\\", "file://")):
         return True
-    if "/" in value and not value.endswith("="):
+    if "/" in stripped_val and not stripped_val.endswith("="):
+        return True
+    if any(marker in stripped_val for marker in REGEX_SYNTAX_MARKERS):
         return True
     return False
 
@@ -242,6 +285,12 @@ def scan_diff_line(diff_line: DiffLine, entropy_threshold: float = 4.0) -> list[
             )
 
     for match in GENERIC_ASSIGNMENT_RE.finditer(line):
+        if line[match.end() :].lstrip().startswith("="):
+            continue
+        key_name = match.group(1).lower()
+        if key_name in NON_SECRET_KEY_NAMES:
+            continue
+
         value_group = 2 if match.group(2) is not None else 3
         secret_val = match.group(value_group)
         span = match.span(value_group)
@@ -251,7 +300,6 @@ def scan_diff_line(diff_line: DiffLine, entropy_threshold: float = 4.0) -> list[
         if _is_env_or_reference(line, secret_val) or _is_placeholder_or_non_secret(secret_val):
             continue
 
-        key_name = match.group(1).lower()
         if any(p in key_name for p in ("password", "passwd", "pwd", "db_pass")):
             reason = "Generic password assignment"
             rule_id = "GENERIC_PASSWORD"
